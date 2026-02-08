@@ -10,6 +10,8 @@ const app = express()
 const port = 3000
 const tokenSecret = "TemporarySecret"
 const activeWebsockets = new Map(); // id -> websocket
+const onlineUsers = new Map(); // id -> Prescence state (online, last)
+const friendMap = new Map(); // id -> Set<friend ids>
 
 app.use(express.json())
 
@@ -43,10 +45,7 @@ function verifyToken(req, res, next) {
 }
 
 app.get("/", async (req, res) => {
-    const connection = await pool.getConnection();
-    const [rows] = await connection.query("SELECT * FROM users")
-
-    res.send(rows[2]);
+    res.send("Hello!")
 })
 
 app.post("/signup", async (req, res) => {
@@ -116,6 +115,17 @@ app.post("/login", async (req, res) => {
             id: user.id,
             username: username
         }
+        
+        const [friends] = await connection.query(
+            `SELECT friend_id FROM friendships
+            WHERE user_id = ? AND status = 'accepted'
+            UNION ALL
+            SELECT user_id AS friend_id FROM friendships
+            WHERE friend_id = ? AND status = 'accepted'
+            `, [user.id, user.id]
+        )
+
+        friendMap.put(user.id, friends.map((data) => data.friend_id))
 
         const token = jwt.sign(payload, tokenSecret, {"expiresIn": "1h"})
         return res.status(200).json({"token": token});
@@ -269,6 +279,9 @@ app.post("/acceptFriend", verifyToken, async (req, res) => {
 
         await connection.commit();
         const targetWebsocket = activeWebsockets.get(friend.id)
+        friendMap.get(friend.id)?.add(user.id);
+        friendMap.get(user.id)?.add(friend.id);
+
         if (targetWebsocket) {
             targetWebsocket.send(JSON.stringify({
                 type: "FRIEND_ACCEPTED",
@@ -321,6 +334,9 @@ app.post("/removeFriend", verifyToken, async (req, res) => {
 
         await connection.commit();
         const targetWebsocket = activeWebsockets.get(targetData[0].id)
+        friendMap.get(targetData[0].id)?.delete(user.id);
+        friendMap.get(user.id)?.delete(targetData[0].id);
+
         if (targetWebsocket) {
             targetWebsocket.send(JSON.stringify({
                 type: "FRIEND_REMOVED",
@@ -899,6 +915,33 @@ app.post("/editMessage", verifyToken, async (req, res) => {
     }
 })
 
+async function prescenceUpdate(id, data) {
+    let connection;
+
+    try {
+        connection = await pool.getConnection();
+        const friends = friendMap.get(id);
+
+        friends.forEach((friendId) => {
+            const targetWebsocket = activeWebsockets.get(friendId);
+            if (!targetWebsocket) return;
+
+            targetWebsocket.send(JSON.stringify({
+                type: "PRESCENCE_UPDATE",
+                payload: {
+                    id: id,
+                    online: data.online,
+                    lastSeen: data.lastSeen
+                }
+            }))
+        })
+    } catch (err) {
+        console.error(err);
+    } finally {
+        if (connection) connection.release();
+    }
+}
+
 const server = http.createServer(app);
 const wss = new WebSocket.Server({server, path:'/ws'});
 wss.on('connection', (ws, req) => {
@@ -919,6 +962,10 @@ wss.on('connection', (ws, req) => {
 
     const account = jwt.decode(token);
     activeWebsockets.set(account.id, ws);
+    onlineUsers.put(account.id, {
+        online: true,
+        lastSeen: Math.floor(Date.now() / 1000)
+    })
 
     ws.on('message', (message) => {
         console.log(`Received: ${message}`);
@@ -926,7 +973,8 @@ wss.on('connection', (ws, req) => {
 
     ws.on('close', () => {
         console.log('Client disconnected');
-        activeWebsockets.delete(account.id)
+        activeWebsockets.delete(account.id);
+        onlineUsers.delete(account.id);
     });
 });
 
