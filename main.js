@@ -125,7 +125,7 @@ app.post("/login", async (req, res) => {
             `, [user.id, user.id]
         )
 
-        friendMap.put(user.id, friends.map((data) => data.friend_id))
+        friendMap.set(user.id, new Set(friends.map((data) => data.friend_id)))
 
         const token = jwt.sign(payload, tokenSecret, {"expiresIn": "1h"})
         return res.status(200).json({"token": token});
@@ -689,6 +689,42 @@ app.post("/openDM", verifyToken, async (req, res) => {
     }
 })
 
+app.post("/conversationMembers", verifyToken, async (req, res) => {
+    const user = req.user;
+    const {conversationId} = req.body;
+    let connection;
+
+    try {
+        connection = await pool.getConnection();
+        
+        const [isMember] = await connection.query(`SELECT 1 FROM conversation_members WHERE user_id = ? and conversationId = ?`, [user.id, conversationId])
+        if (isMember.length == 0) {
+            return res.status(403).json({"message": "You are either not a part of this conversation or it doesn't exist."})
+        }
+
+        const [rows] = await connection.query(
+            `SELECT cm.user_id AS id, u.username
+            FROM conversation_members cm
+            JOIN users u ON u.id = cm.user_id
+            WHERE cm.conversationId = ?
+            `, [conversationId]
+        )
+
+        rows.map((row) => {
+            row.online = onlineUsers.get(row.id)?.online
+        })
+
+        return res.status(200).json({
+            members: rows
+        })
+    } catch (err) {
+        console.error(err);
+        return res.status(500).json({"message": "Internal Server Error"});
+    } finally {
+        if (connection) connection.release();
+    }
+})
+
 app.post("/sendMessage", verifyToken, async (req, res) => {
     let user = req.user;
     const {content, conversationId} = req.body;
@@ -962,10 +998,12 @@ wss.on('connection', (ws, req) => {
 
     const account = jwt.decode(token);
     activeWebsockets.set(account.id, ws);
-    onlineUsers.put(account.id, {
+    onlineUsers.set(account.id, {
         online: true,
         lastSeen: Math.floor(Date.now() / 1000)
     })
+
+    prescenceUpdate(account.id, onlineUsers.get(account.id))
 
     ws.on('message', (message) => {
         console.log(`Received: ${message}`);
@@ -974,7 +1012,8 @@ wss.on('connection', (ws, req) => {
     ws.on('close', () => {
         console.log('Client disconnected');
         activeWebsockets.delete(account.id);
-        onlineUsers.delete(account.id);
+        prescenceUpdate(account.id, {online: false, lastSeen: Math.floor(Date.now() / 1000)})
+        onlineUsers.delete(account.id)
     });
 });
 
