@@ -4,14 +4,59 @@ const WebSocket = require("ws");
 const mysql2 = require("mysql2/promise")
 const bcrypt = require("bcrypt")
 const jwt = require("jsonwebtoken");
-const { transcode } = require("buffer");
-const { create } = require("domain");
 const app = express()
 const port = 3000
 const tokenSecret = "TemporarySecret"
 const activeWebsockets = new Map(); // id -> websocket
 const onlineUsers = new Map(); // id -> Prescence state (online, last)
 const friendMap = new Map(); // id -> Set<friend ids>
+
+const multer = require("multer");
+const path = require("path");
+const fs = require("fs");
+const uploadDir = path.join(__dirname, "uploads/avatars")
+
+if (!fs.existsSync(uploadDir)) {
+    fs.mkdirSync(uploadDir, {recursive:true});
+}
+
+const storage = multer.diskStorage({
+    destination: uploadDir,
+    filename: (req, file, cb) => {
+        const ext = path.extname(file.originalname);
+        cb(null, `${req.user.id}${ext}`)
+    }
+})
+
+const upload = multer({
+    storage,
+    limits: {fileSize: 2 * 1024 * 1024},
+    fileFilter: (req, file, cb) => {
+        if (!file.mimetype.startsWith("image/")) {
+            return cb(new Error("Only images allowed"))
+        }
+
+        cb(null, true);
+    }
+})
+
+app.post("/uploadAvatar", verifyToken, upload.single("avatar"), async (req, res) => {
+    const filePath = `/uploads/avatars/${req.file.filename}`
+
+    await pool.query(
+        `UPDATE users SET avatar_path = ? WHERE id = ?`, [filePath, req.user.id]
+    )
+
+    return res.json({avatarPath: filePath});
+})
+
+app.get("/avatar/:userId", verifyToken, async (req, res) => {
+    const [rows] = await pool.query(`SELECT avatar_path FROM users WHERE id = ?`, req.params.userId);
+
+    if (rows.length == 0) return res.status(404).json({"message": "Avatar not found"});
+
+    return res.sendFile(path.join(__dirname, rows[0].avatarPath));
+})
 
 app.use(express.json())
 
@@ -145,7 +190,18 @@ app.post("/profile", verifyToken, async (req, res) => {
     try {
         connection = await pool.getConnection();
 
-        const [result] = await connection.query("SELECT id, username FROM users WHERE (username = ?)", [searchParam])
+        const [result] = await connection.query(`
+            WITH viewer AS (
+                SELECT ? AS id
+            ) 
+            SELECT u.id,
+            u.username,
+            IF (u.id = v.id, u.settings, NULL) AS settings
+            FROM users u, viewer v 
+            WHERE (u.username = ?)
+            `
+            , [user.id, searchParam]
+        )
         if (result.length == 0) {
             return res.status(404).json({"message": "User not found"});
         }
