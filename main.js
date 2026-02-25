@@ -495,6 +495,9 @@ app.get("/getConversations", verifyToken, async (req, res) => {
                 WHEN c.isGroup = TRUE THEN c.conversationName
                 ELSE u.username
             END AS displayName,
+            CASE
+                WHEN c.isGroup = FALSE THEN u.id
+            END AS dmTargetId,
             COALESCE(
                 (SELECT 
                     JSON_ARRAYAGG(
@@ -528,7 +531,7 @@ app.get("/getConversations", verifyToken, async (req, res) => {
                 u.id = other.user_id
 
             WHERE m.user_id = ?
-            GROUP BY c.conversationId, u.username;
+            GROUP BY c.conversationId, u.username, u.id;
             `, [user.id]
         )
 
@@ -724,6 +727,7 @@ app.post("/openDM", verifyToken, async (req, res) => {
                     conversationId: creationResultConvo.insertId,
                     isGroup: 0,
                     lastMessage: null,
+                    dmTargetId: id != user.id ? user.id : targetDetails.id,
                     lastUpdated: Math.floor(Date.now() / 1000),
                     displayName: id != user.id ? user.username : targetDetails.username,
                     messages: []
@@ -1005,6 +1009,24 @@ app.post("/editMessage", verifyToken, async (req, res) => {
     } finally {
         if (connection) connection.release();
     }
+})
+
+/// Calling
+app.post("/callRequest", verifyToken, async (req, res) => {
+    const user = req.user;
+    const {targetUID} = req.body;
+
+    const targetWebsocket = activeWebsockets.get(targetUID)
+    if (targetWebsocket) {
+        targetWebsocket.send(JSON.stringify({
+            type: "CALL_INBOUND",
+            payload: {
+                from: user.username
+            }
+        }))
+    }
+    
+    return res.status(201).json({"message": "Call created"});
 })
 
 async function prescenceUpdate(id, data) {
