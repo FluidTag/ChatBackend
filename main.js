@@ -1012,21 +1012,50 @@ app.post("/editMessage", verifyToken, async (req, res) => {
 })
 
 /// Calling
-app.post("/callRequest", verifyToken, async (req, res) => {
+app.post("/acceptCall", verifyToken, async (req, res) => {
     const user = req.user;
-    const {targetUID} = req.body;
+    const {targetUID, udpPort} = req.body;
 
     const targetWebsocket = activeWebsockets.get(targetUID)
+
+    if (targetWebsocket) {
+        targetWebsocket.send(JSON.stringify({
+            type: "CALL_ACCEPTED",
+            payload: {
+                from: user.username,
+                fromId: user.id,
+                udpPort: udpPort,
+                publicAddress: req.ip
+            }
+        }))
+    } else {
+        return res.status(404).json({"message": "Target websocket missing"})
+    }
+
+    return res.status(201).json({"message": "Successfuly sent update"});
+})
+
+app.post("/sendCallRequest", verifyToken, async (req, res) => {
+    const user = req.user;
+    const {targetUID, udpPort} = req.body;
+
+    const targetWebsocket = activeWebsockets.get(targetUID)
+
     if (targetWebsocket) {
         targetWebsocket.send(JSON.stringify({
             type: "CALL_INBOUND",
             payload: {
-                from: user.username
+                from: user.username,
+                fromId: user.id,
+                udpPort: udpPort,
+                publicAddress: req.ip
             }
         }))
+    } else {
+        return res.status(404).json({"message": "Target websocket not found"})
     }
     
-    return res.status(201).json({"message": "Call created"});
+    return res.status(201).json({"message": "Successfuly created call request"});
 })
 
 async function prescenceUpdate(id, data) {
