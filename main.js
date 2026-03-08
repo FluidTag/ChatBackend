@@ -495,9 +495,6 @@ app.get("/getConversations", verifyToken, async (req, res) => {
                 WHEN c.isGroup = TRUE THEN c.conversationName
                 ELSE u.username
             END AS displayName,
-            CASE
-                WHEN c.isGroup = FALSE THEN u.id
-            END AS dmTargetId,
             COALESCE(
                 (SELECT 
                     JSON_ARRAYAGG(
@@ -1012,50 +1009,135 @@ app.post("/editMessage", verifyToken, async (req, res) => {
 })
 
 /// Calling
-app.post("/acceptCall", verifyToken, async (req, res) => {
-    const user = req.user;
-    const {targetUID, udpPort} = req.body;
+const dgram = require("dgram")
+const callServer = dgram.createSocket('udp4')
+const rooms = new Map();
+let roomsCreatedCount = 0;
 
-    const targetWebsocket = activeWebsockets.get(targetUID)
-
-    if (targetWebsocket) {
-        targetWebsocket.send(JSON.stringify({
-            type: "CALL_ACCEPTED",
-            payload: {
-                from: user.username,
-                fromId: user.id,
-                udpPort: udpPort,
-                publicAddress: req.ip
-            }
-        }))
-    } else {
-        return res.status(404).json({"message": "Target websocket missing"})
-    }
-
-    return res.status(201).json({"message": "Successfuly sent update"});
+callServer.on('error', (err) => {
+    console.log("Server Error: \n" + err.stack);
+    callServer.close();
 })
 
+callServer.on('message', (msg, rinfo) => {
+    routeAudio(msg, rinfo)
+})
+
+function routeAudio(msg, rinfo) {
+    if (msg.length < 8) return;
+    
+    const roomId = msg.readInt32BE(0);
+    const userId = msg.readInt32BE(4);
+    const room = rooms.get(roomId)
+
+    if (!room) return;
+
+    let sender = room.participants.find(p => p.userId === userId)
+    if (sender) {
+        sender.actualAddress = rinfo.address;
+        sender.actualPort = rinfo.port;
+    }
+
+    const participants = room.participants;
+    participants.forEach((peer) => {
+        if (peer.userId !== userId && peer.actualAddress && peer.actualPort) {
+            callServer.send(msg, peer.actualPort, peer.actualAddress, (err) => {
+                if (err) console.error("Forwarding failure: ", err);
+            })
+        }
+    })
+}
+
+callServer.on(`listening`, () => {
+    const address = callServer.address();
+    console.log(`UDP Server listening on ${address.address}:${address.port}`);
+})
+
+callServer.bind(5000)
+
+app.post("/acceptCall", verifyToken, async (req, res) => {
+    const user = req.user;
+    const {roomId, udpPort} = req.body;
+
+    if (!rooms.get(roomId)) {
+        return res.status(404).json({"message": "Call not found"})
+    }
+
+    let roomData = rooms.get(roomId);
+    const invited = roomData.invitedParticipants
+    let authorized = false;
+    for (let i = 0; i < invited.length; i++) {
+        if (invited[i] === user.id) {
+            authorized = true;
+            break
+        }
+    }
+
+    if (!authorized) {
+        return res.status(403).json({"message": "You are not authorized to join this call"})
+    }
+
+    let participants = roomData.participants;
+    const newPayload = {
+        publicAddress: req.ip,
+        udpPort: udpPort,
+        userId: user.id,
+        username: user.username
+    }
+
+    participants.forEach((peer) => {
+        const targetWebsocket = activeWebsockets.get(peer.userId);
+        if (!targetWebsocket) return;
+
+        targetWebsocket.send(JSON.stringify({
+            type: "CALL_JOIN",
+            payload: newPayload
+        }))
+    })
+
+    participants.push(newPayload)
+    
+    return res.status(201).json({"message": "Successfuly joined call"});
+})
+
+// Create a room and send out call requests
 app.post("/sendCallRequest", verifyToken, async (req, res) => {
     const user = req.user;
-    const {targetUID, udpPort} = req.body;
+    const {targetUIDs, udpPort} = req.body;
+    const roomId = roomsCreatedCount++;
 
-    const targetWebsocket = activeWebsockets.get(targetUID)
+    rooms.set(roomId, {
+        created: Math.floor(Date.now() / 1000),
+        participants: [{
+            publicAddress: req.ip,
+            udpPort: udpPort,
+            userId: user.id,
+            username: user.username
+        }], // Initial Participant
+        invitedParticipants: targetUIDs // People allowed to join the call
+    })
 
-    if (targetWebsocket) {
+    targetUIDs.forEach((id) => {
+        const targetWebsocket = activeWebsockets.get(id);
+        if (!targetWebsocket || id === user.id) return
+
         targetWebsocket.send(JSON.stringify({
             type: "CALL_INBOUND",
             payload: {
                 from: user.username,
                 fromId: user.id,
-                udpPort: udpPort,
-                publicAddress: req.ip
+                roomId: roomId,
+                serverPort: 5000,
+                serverIp: "127.0.0.1"
             }
         }))
-    } else {
-        return res.status(404).json({"message": "Target websocket not found"})
-    }
+    })
     
-    return res.status(201).json({"message": "Successfuly created call request"});
+    return res.status(201).json({
+        serverPort: 5000,
+        serverIp: "127.0.0.1",
+        roomId: roomId
+    });
 })
 
 async function prescenceUpdate(id, data) {
